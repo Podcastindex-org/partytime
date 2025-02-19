@@ -1,19 +1,21 @@
 use std::fs;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::error::Error;
 use std::mem::drop;
 use std::thread::{sleep, spawn};
-use std::sync::{Arc,Mutex};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use xml::attribute::OwnedAttribute;
 use xml::reader::{EventReader, XmlEvent};
-
+use flate2::read::GzDecoder;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 #[derive(Default, Debug)]
 struct Feed {
-    title : String,
+    title: String,
     #[allow(dead_code)]
-    description : String,
+    description: String,
     #[allow(dead_code)]
     items: Vec<Item>,
     live_items: Vec<LiveItem>,
@@ -22,20 +24,20 @@ struct Feed {
 #[derive(Default, Debug)]
 struct Item {
     #[allow(dead_code)]
-    title : String,
+    title: String,
     #[allow(dead_code)]
-    description : String,
+    description: String,
 }
 
 #[derive(Default, Debug)]
 struct LiveItem {
     #[allow(dead_code)]
-    title : String,
+    title: String,
     #[allow(dead_code)]
-    description : String,
+    description: String,
 }
 
-#[derive(Default,Debug)]
+#[derive(Default, Debug)]
 struct XmlLocation {
     #[allow(dead_code)]
     path: Vec<String>,
@@ -51,15 +53,23 @@ fn main() -> std::io::Result<()> {
 
     let mut cg_parsers = vec![];
 
-    //Get test feeds
+    // Get test feeds
     let paths = fs::read_dir("./test_feeds").unwrap();
     for path in paths {
-        let file = File::open(path.unwrap().path()).unwrap();
+        let path = path.unwrap().path();
+        let file = File::open(&path).unwrap();
         let file = BufReader::new(file);
-        cg_parsers.push(EventReader::new(file));
+
+        let parser: EventReader<Box<dyn Read + Send>> = match path.extension().and_then(|s| s.to_str()) {
+            Some("gz") => EventReader::new(Box::new(GzDecoder::new(file))),
+            Some("zst") => EventReader::new(Box::new(ZstdDecoder::new(file).unwrap())),
+            _ => EventReader::new(Box::new(file)),
+        };
+
+        cg_parsers.push(parser);
     }
 
-    //Run each parse in parallel
+    // Run each parse in parallel
     for parser in cg_parsers {
         let outstanding_job_count = cg_job_count.clone();
         let mut locked_job_count = outstanding_job_count.lock().unwrap();
@@ -69,21 +79,14 @@ fn main() -> std::io::Result<()> {
         let total_items_count = total_items_parsed.clone();
 
         spawn(move || {
-            //println!("Parsing xml...", );
+            // println!("Parsing xml...", );
             let mut pfeed: Feed = Default::default();
             let mut context = 0;
             let mut inside = vec![];
             for e in parser {
                 match e {
-                    Ok(
-                        XmlEvent::StartElement {
-                            name,
-                            attributes,
-                            namespace: _,
-                            ..
-                        }
-                    ) => {
-                        //print element data
+                    Ok(XmlEvent::StartElement { name, attributes, namespace: _, .. }) => {
+                        // print element data
                         let mut tag_name = name.local_name;
                         if let Some(p) = name.prefix {
                             tag_name = format!("{}:{}", p, tag_name).to_lowercase().trim().to_string();
@@ -113,16 +116,16 @@ fn main() -> std::io::Result<()> {
                         }
                         inside.push(tag_name);
 
-                        //println!("{} {}", "  ".repeat(inside.len()), inside.last().unwrap());
+                        // println!("{} {}", "  ".repeat(inside.len()), inside.last().unwrap());
                         let result = xml_parse_attributes(&attributes);
                         if let Ok(attr) = result.as_ref() {
                             for _a in attr {
-                                //println!("{}  --{} = [{}]", "  ".repeat(inside.len()), a.0, a.1);
+                                // println!("{}  --{} = [{}]", "  ".repeat(inside.len()), a.0, a.1);
                             }
                         }
                     }
                     Ok(XmlEvent::CData(data)) => {
-                        //println!("{:#?} -> {:#?}", channel_or_item, inside.last().unwrap());
+                        // println!("{:#?} -> {:#?}", channel_or_item, inside.last().unwrap());
 
                         let _location = XmlLocation {
                             path: inside.clone(),
@@ -130,7 +133,7 @@ fn main() -> std::io::Result<()> {
                             element: data.clone(),
                         };
 
-                        //Channel context
+                        // Channel context
                         if context == 0 && inside.last().unwrap() == "title" {
                             pfeed.title = data.clone().trim().to_string();
                         }
@@ -138,7 +141,7 @@ fn main() -> std::io::Result<()> {
                             pfeed.description = data.clone().trim().to_string();
                         }
 
-                        //Item context
+                        // Item context
                         if context == 1 && inside.last().unwrap() == "title" {
                             let pitem = pfeed.items.last_mut().unwrap();
                             pitem.title = data.clone().trim().to_string();
@@ -148,7 +151,7 @@ fn main() -> std::io::Result<()> {
                             pitem.description = data.clone().trim().to_string();
                         }
 
-                        //LiveItem context
+                        // LiveItem context
                         if context == 2 && inside.last().unwrap() == "title" {
                             let pitem = pfeed.live_items.last_mut().unwrap();
                             pitem.title = data.clone().trim().to_string();
@@ -159,7 +162,7 @@ fn main() -> std::io::Result<()> {
                         }
                     }
                     Ok(XmlEvent::Characters(data)) => {
-                        //println!("{:#?} -> {:#?}", channel_or_item, inside.last().unwrap());
+                        // println!("{:#?} -> {:#?}", channel_or_item, inside.last().unwrap());
 
                         let _location = XmlLocation {
                             path: inside.clone(),
@@ -167,7 +170,7 @@ fn main() -> std::io::Result<()> {
                             element: data.clone(),
                         };
 
-                        //Channel context
+                        // Channel context
                         if context == 0 && inside.last().unwrap() == "title" {
                             pfeed.title = data.clone().trim().to_string();
                         }
@@ -175,7 +178,7 @@ fn main() -> std::io::Result<()> {
                             pfeed.description = data.clone().trim().to_string();
                         }
 
-                        //Item context
+                        // Item context
                         if context == 1 && inside.last().unwrap() == "title" {
                             let pitem = pfeed.items.last_mut().unwrap();
                             pitem.title = data.clone().trim().to_string();
@@ -185,7 +188,7 @@ fn main() -> std::io::Result<()> {
                             pitem.description = data.clone().trim().to_string();
                         }
 
-                        //LiveItem context
+                        // LiveItem context
                         if context == 2 && inside.last().unwrap() == "title" {
                             let pitem = pfeed.live_items.last_mut().unwrap();
                             pitem.title = data.clone().trim().to_string();
@@ -226,7 +229,7 @@ fn main() -> std::io::Result<()> {
                         *locked_job_count -= 1;
                         drop(locked_job_count);
                         break;
-                    },
+                    }
                     // There's more: https://docs.rs/xml-rs/latest/xml/reader/enum.XmlEvent.html
                     _ => {}
                 }
@@ -236,10 +239,10 @@ fn main() -> std::io::Result<()> {
 
     let outstanding_job_count = cg_job_count.clone();
     let total_items_count = total_items_parsed.clone();
-    loop{
+    loop {
         let locked_job_count = outstanding_job_count.lock().unwrap();
         let locked_items_count = total_items_count.lock().unwrap();
-        //println!("[{:?}] waiting...", locked_job_count);
+        // println!("[{:?}] waiting...", locked_job_count);
         if *locked_job_count == 0 {
             println!("Done!");
             println!("Total items parsed: {}", locked_items_count);
@@ -247,14 +250,13 @@ fn main() -> std::io::Result<()> {
         }
         drop(locked_job_count);
         drop(locked_items_count);
-        sleep(time::Duration::seconds(1).try_into().unwrap());
+        sleep(Duration::from_secs(1));
     }
 
     Ok(())
 }
 
 fn xml_parse_attributes(attr: &Vec<OwnedAttribute>) -> Result<Vec<(String, String)>, Box<dyn Error>> {
-
     let mut attributes = vec![];
 
     for a in attr {
@@ -266,5 +268,5 @@ fn xml_parse_attributes(attr: &Vec<OwnedAttribute>) -> Result<Vec<(String, Strin
         attributes.push((a_name.clone(), a_value.clone()));
     }
 
-    return Ok(attributes);
+    Ok(attributes)
 }
